@@ -8,7 +8,7 @@ Sora2 Manager
 
 自动化批量生产：
 
-台词模式 (Script Mode)：一次性输入多行文案，配合提示词占位符 这是台词文案，实现“一键百片”。
+台词模式 (Script Mode)：一次性输入多行文案，配合提示词占位符“这是台词文案”，实现“一键百片”。
 
 重复模式 (Repeat Mode)：针对同一提示词进行多次“抽卡式”生成，筛选最佳视觉效果。
 
@@ -69,10 +69,10 @@ npm run electron:build
 
 在软件右上角的 设置 (Settings) 面板中，你可以配置：
 
-API Endpoint: 你的 Sora 兼容 API 地址（如 http://localhost:8000/v1/chat/completions）。
+API Endpoint: 你的Sora2API地址（如 http://localhost:8000/v1/chat/completions）。
 API Key: 你的访问凭证。
 并发控制: 同时发射的请求数。
-提交间隔: 两次请求之间的冷却时间（建议设为 0.5s - 2s）。
+提交间隔: 两次请求之间的冷却时间（非代理池建议设为6s+，若采用代理池可适当减少）。
 
 ⚖️ 免责声明
 
