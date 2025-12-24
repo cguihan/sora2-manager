@@ -66,16 +66,15 @@ export default function App() {
     taskInterval: 1.0, 
   });
 
-  // --- 项目管理状态 ---
-  const [projects, setProjects] = useState([
-      { id: 1, name: '示例项目 A', prompt: 'Product cinematic shot on a wooden table, 这是台词文案, 4k resolution.', image: null, imageName: null }
-  ]);
-  const [activeProjectId, setActiveProjectId] = useState(1);
+    // --- 项目管理状态 ---
+    // 初始设为空，启动时从 localStorage 恢复（或回退到示例项目）
+    const [projects, setProjects] = useState([]);
+    const [activeProjectId, setActiveProjectId] = useState(null);
   const [editingProjectId, setEditingProjectId] = useState(null);
   const [editName, setEditName] = useState('');
 
   // --- 当前项目输入状态 ---
-  const [activeProject, setActiveProject] = useState(projects[0]);
+    const [activeProject, setActiveProject] = useState(null);
   const [orientation, setOrientation] = useState('portrait');
   const [duration, setDuration] = useState('15s');
   const [modelName, setModelName] = useState('sora-video-portrait-15s');
@@ -102,6 +101,10 @@ export default function App() {
   const logsEndRef = useRef(null);
   const batchInputRef = useRef(null);
   const lastTaskStartTime = useRef(0);
+    const projectsLoadedRef = useRef(false);
+    const composingRef = useRef(false);
+    const settingsLoadedRef = useRef(false);
+    const queueLoadedRef = useRef(false);
   const [tick, setTick] = useState(0);
   const toastTimer = useRef(null);
 
@@ -129,6 +132,142 @@ export default function App() {
     return () => clearTimeout(timer);
   }, []);
 
+    // 加载持久化设置与项目（仅使用 localStorage，避免覆盖）
+    useEffect(() => {
+        const loadPersisted = () => {
+            let savedSettings = null;
+            let savedProjects = null;
+
+            try { const s = localStorage.getItem('sora2-settings'); savedSettings = s ? JSON.parse(s) : null; } catch (e) { console.error('read localStorage settings failed', e); }
+            try { const p = localStorage.getItem('sora2-projects'); savedProjects = p ? JSON.parse(p) : null; } catch (e) { console.error('read localStorage projects failed', e); }
+
+            if (savedSettings && typeof savedSettings === 'object') {
+                // 恢复 config，并且尝试恢复 UI 相关状态
+                setConfig(prev => ({ ...prev, ...savedSettings }));
+                if (savedSettings.orientation) setOrientation(savedSettings.orientation);
+                if (savedSettings.duration) setDuration(savedSettings.duration);
+                if (savedSettings.generationType) setGenerationType(savedSettings.generationType);
+                if (savedSettings.modelName) setModelName(savedSettings.modelName);
+            }
+
+            if (Array.isArray(savedProjects)) {
+                if (savedProjects.length > 0) {
+                    setProjects(savedProjects);
+                    setActiveProjectId(savedProjects[0].id);
+                }
+            } else if (savedProjects && typeof savedProjects === 'object') {
+                if (Array.isArray(savedProjects.projects) && savedProjects.projects.length > 0) {
+                    setProjects(savedProjects.projects);
+                    if (savedProjects.activeId) setActiveProjectId(savedProjects.activeId);
+                    else setActiveProjectId(savedProjects.projects[0].id);
+                }
+            } else {
+                // 未找到已保存的数据 -> 使用内置示例并设为已加载状态
+                const sample = [{ id: 1, name: '示例项目 A', prompt: 'Product cinematic shot on a wooden table, 这是台词文案, 4k resolution.', image: null, imageName: null }];
+                setProjects(sample);
+                setActiveProjectId(sample[0].id);
+            }
+
+            // 恢复队列（如果存在）
+            try {
+                const q = localStorage.getItem('sora2-queue');
+                const parsed = q ? JSON.parse(q) : null;
+                if (Array.isArray(parsed)) {
+                    const normalized = parsed.map(t => {
+                        if (['GENERATING','STARTING','PROCESSING','CACHING'].includes(t.status)) {
+                            return { ...t, status: 'PENDING', stage: '等待中', progress: 0 };
+                        }
+                        return t;
+                    });
+                    setQueue(normalized);
+                }
+            } catch (e) {
+                console.error('read localStorage queue failed', e);
+            }
+
+            // 延迟标记为已加载，确保上面通过 setState 的更新先被 React 应用，
+            // 再开启自动持久化，避免用旧的默认值覆盖本地存储。
+            setTimeout(() => {
+                projectsLoadedRef.current = true;
+                settingsLoadedRef.current = true;
+                queueLoadedRef.current = true;
+            }, 0);
+        };
+        loadPersisted();
+    }, []);
+
+    // 当项目或选中项目改变时持久化保存（仅 localStorage），但在初始加载完成之前不保存以免覆盖
+    useEffect(() => {
+        if (!projectsLoadedRef.current) return;
+        const payload = { projects, activeId: activeProjectId };
+        try {
+            localStorage.setItem('sora2-projects', JSON.stringify(payload));
+            addLog('系统: 项目已保存到 localStorage。', 'success');
+        } catch (e) {
+            addLog('系统: 保存到 localStorage 失败。', 'error');
+        }
+    }, [projects, activeProjectId]);
+
+    // 当生产队列改变时持久化（恢复后才保存），刷新时将未完成任务标记为 PENDING 以便恢复处理
+    useEffect(() => {
+        if (!queueLoadedRef.current) return;
+        try {
+            localStorage.setItem('sora2-queue', JSON.stringify(queue));
+            addLog('系统: 队列已保存到 localStorage。', 'success');
+        } catch (e) {
+            addLog('系统: 保存队列到 localStorage 失败。', 'error');
+        }
+    }, [queue]);
+
+    // 持久化 UI 设置（合并到 sora2-settings）
+    useEffect(() => {
+        if (!settingsLoadedRef.current) return;
+        const persistSettings = () => {
+            try {
+                const raw = localStorage.getItem('sora2-settings');
+                const base = raw ? JSON.parse(raw) : {};
+                const toSave = { ...base, ...config, orientation, duration, generationType, modelName };
+                localStorage.setItem('sora2-settings', JSON.stringify(toSave));
+            } catch (e) {
+                console.error('persist settings failed', e);
+            }
+        };
+        persistSettings();
+    }, [config, orientation, duration, generationType, modelName]);
+
+    // helper: 立即保存 projects 到 localStorage（在关键操作后调用以保证数据不丢失）
+    const saveProjectsToLocalStorage = (projectsToSave, activeIdToSave) => {
+        try {
+            const payload = { projects: projectsToSave, activeId: activeIdToSave };
+            localStorage.setItem('sora2-projects', JSON.stringify(payload));
+            addLog('系统: 项目已保存到 localStorage。', 'success');
+            projectsLoadedRef.current = true;
+        } catch (e) {
+            addLog('系统: 保存到 localStorage 失败。', 'error');
+        }
+    };
+
+    const handleSaveSettings = async () => {
+        const toSave = { ...config, orientation, duration, generationType, modelName };
+        if (window.electronAPI && typeof window.electronAPI.saveSettings === 'function') {
+            try {
+                await window.electronAPI.saveSettings(toSave);
+                addLog('系统: 设置已保存到用户数据目录。', 'success');
+            } catch (e) {
+                addLog('系统: 保存设置失败。', 'error');
+            }
+        } else {
+            try {
+                localStorage.setItem('sora2-settings', JSON.stringify(toSave));
+                addLog('系统: 设置已保存到 localStorage。', 'success');
+            } catch (e) {
+                addLog('系统: 保存到 localStorage 失败。', 'error');
+            }
+        }
+        settingsLoadedRef.current = true;
+        setShowSettings(false);
+    };
+
   useEffect(() => {
     const runningCount = queue.filter(t => t.status === 'GENERATING' || t.status === 'STARTING' || t.status === 'PROCESSING' || t.status === 'CACHING').length;
     const pendingTasks = queue.filter(t => t.status === 'PENDING');
@@ -155,7 +294,7 @@ export default function App() {
 
   useEffect(() => {
       const proj = projects.find(p => p.id === activeProjectId);
-      if (proj) setActiveProject(proj);
+      if (proj && !composingRef.current) setActiveProject(proj);
   }, [activeProjectId, projects]);
 
   useEffect(() => {
@@ -196,16 +335,20 @@ export default function App() {
   const handleCreateProject = () => {
       const newId = Date.now();
       const newProject = { id: newId, name: `新项目 ${projects.length + 1}`, prompt: '', image: null, imageName: null };
-      setProjects([...projects, newProject]);
+      const newProjects = [...projects, newProject];
+      setProjects(newProjects);
       setActiveProjectId(newId);
+      saveProjectsToLocalStorage(newProjects, newId);
   };
 
   const handleDeleteProject = (e, id) => {
       e.stopPropagation();
       if (projects.length <= 1) return; 
       const newProjects = projects.filter(p => p.id !== id);
+      const newActiveId = activeProjectId === id ? newProjects[0].id : activeProjectId;
       setProjects(newProjects);
-      if (activeProjectId === id) setActiveProjectId(newProjects[0].id);
+      setActiveProjectId(newActiveId);
+      saveProjectsToLocalStorage(newProjects, newActiveId);
   };
 
   const startRenaming = (e, project) => {
@@ -216,12 +359,21 @@ export default function App() {
 
   const saveRename = () => {
       if (!editName.trim()) return;
-      setProjects(prev => prev.map(p => p.id === editingProjectId ? { ...p, name: editName } : p));
+      if (composingRef.current) return; // 等待输入法组成结束
+      const next = projects.map(p => p.id === editingProjectId ? { ...p, name: editName } : p);
+      setProjects(next);
+      saveProjectsToLocalStorage(next, activeProjectId);
       setEditingProjectId(null);
   };
 
   const updateActiveProject = (field, value) => {
-      setProjects(prev => prev.map(p => p.id === activeProjectId ? { ...p, [field]: value } : p));
+      // 先更新本地 activeProject，以便输入时立即响应
+      setActiveProject(prev => prev ? { ...prev, [field]: value } : prev);
+      // 在输入法组合期间不要触发全局 projects 更新，防止覆盖并中断 IME
+      if (composingRef.current) return;
+      const next = projects.map(p => p.id === activeProjectId ? { ...p, [field]: value } : p);
+      setProjects(next);
+      saveProjectsToLocalStorage(next, activeProjectId);
   };
 
   const handleFileUpload = (e) => {
@@ -229,7 +381,11 @@ export default function App() {
     if (file) {
       const reader = new FileReader();
       reader.onloadend = () => {
-        setProjects(prev => prev.map(p => p.id === activeProjectId ? { ...p, image: reader.result, imageName: file.name } : p));
+                setProjects(prev => {
+                    const next = prev.map(p => p.id === activeProjectId ? { ...p, image: reader.result, imageName: file.name } : p);
+                    saveProjectsToLocalStorage(next, activeProjectId);
+                    return next;
+                });
       };
       reader.readAsDataURL(file);
     }
@@ -279,7 +435,8 @@ export default function App() {
       const newTaskId = Date.now() + Math.random(); 
       const newTask = {
           id: newTaskId,
-          projectName: activeProject.name,
+          projectId: activeProjectId,
+          projectName: activeProject?.name,
           prompt: String(prompt),
           scriptSnippet: String(scriptSnippet), 
           status: 'PENDING',
@@ -457,7 +614,7 @@ export default function App() {
                     <div key={proj.id} onClick={() => setActiveProjectId(proj.id)} className={`group flex items-center gap-3 px-3 py-3 rounded-lg cursor-pointer transition-colors border ${activeProjectId === proj.id ? 'bg-white border-gray-200 shadow-sm text-blue-600' : 'border-transparent text-gray-600 hover:bg-gray-100'}`}>
                         <IconFolder size={16} className={activeProjectId === proj.id ? 'text-blue-400' : 'text-gray-600'} />
                         {editingProjectId === proj.id ? (
-                            <input autoFocus value={editName} onChange={(e) => setEditName(e.target.value)} onBlur={saveRename} onKeyDown={(e) => e.key === 'Enter' && saveRename()} className="bg-white border border-blue-500 rounded px-1 py-0.5 text-xs text-gray-900 w-full outline-none" />
+                            <input autoFocus value={editName} onChange={(e) => setEditName(e.target.value)} onBlur={saveRename} onKeyDown={(e) => e.key === 'Enter' && saveRename()} onCompositionStart={() => composingRef.current = true} onCompositionEnd={() => composingRef.current = false} className="bg-white border border-blue-500 rounded px-1 py-0.5 text-xs text-gray-900 w-full outline-none" />
                         ) : (
                             <span className="text-sm font-medium truncate flex-1">{String(proj.name || '')}</span>
                         )}
@@ -484,7 +641,7 @@ export default function App() {
                             </div>
                             <div className="space-y-2">
                                 <label className="text-xs font-semibold text-gray-500 uppercase tracking-wider flex justify-between">总提示词 (Master Prompt)<span className="text-xs text-blue-600 normal-case bg-blue-50 px-2 py-0.5 rounded">使用 "这是台词文案" 作为占位符</span></label>
-                                <textarea value={String(activeProject?.prompt || '')} onChange={(e) => updateActiveProject('prompt', e.target.value)} className="w-full bg-gray-50 border border-gray-200 rounded-lg p-4 text-gray-900 placeholder-gray-400 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all resize-none min-h-[140px] font-mono text-sm leading-relaxed" placeholder="例如：一个精美的咖啡杯，这是台词文案，4k分辨率..." />
+                                <textarea value={String(activeProject?.prompt || '')} onChange={(e) => updateActiveProject('prompt', e.target.value)} onCompositionStart={() => composingRef.current = true} onCompositionEnd={(e) => { composingRef.current = false; updateActiveProject('prompt', e.target.value); }} className="w-full bg-gray-50 border border-gray-200 rounded-lg p-4 text-gray-900 placeholder-gray-400 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all resize-none min-h-[140px] font-mono text-sm leading-relaxed" placeholder="例如：一个精美的咖啡杯，这是台词文案，4k分辨率..." />
                             </div>
                             {generationType === 'image' && (
                                 <div className="space-y-2 animate-in fade-in slide-in-from-top-2 duration-300">
@@ -541,7 +698,7 @@ export default function App() {
                 <section className="flex-1 pb-20">
                     <div className="flex items-center justify-between mb-4 px-1">
                         <h2 className="text-lg font-bold text-gray-900">生产队列</h2>
-                        <span className="text-xs font-medium bg-gray-200 text-gray-600 px-2 py-1 rounded-full">{queue.length} 个任务</span>
+                        <span className="text-xs font-medium bg-gray-200 text-gray-600 px-2 py-1 rounded-full">{queue.filter(t => t.projectId === activeProjectId).length} 个任务</span>
                     </div>
                     <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm min-h-[200px]">
                         <div className="overflow-x-auto">
@@ -554,7 +711,7 @@ export default function App() {
                                     </tr>
                                 </thead>
                                 <tbody className="divide-y divide-gray-100">
-                                    {queue.map((task) => (
+                                    {queue.filter(t => t.projectId === activeProjectId).map((task) => (
                                         <tr key={task.id} className="group hover:bg-gray-50 transition-colors">
                                             <td className="p-4">
                                                 <div className="w-24 h-14 bg-gray-100 rounded border border-gray-200 flex items-center justify-center overflow-hidden relative shadow-sm">
@@ -617,7 +774,7 @@ export default function App() {
                       {batchMode === 'script' ? (
                           <div className="w-full space-y-3">
                               {batchScripts.map((script, idx) => (
-                                  <div key={idx} className="flex gap-3 items-center animate-in slide-in-from-left-2 duration-300"><span className="text-xs font-mono text-gray-400 w-6 text-right">{idx + 1}.</span><input ref={idx === batchScripts.length - 1 ? batchInputRef : null} type="text" value={String(script)} placeholder={idx === batchScripts.length - 1 ? "输入新台词文案..." : ""} onChange={(e) => handleScriptChange(idx, e.target.value)} className="flex-1 bg-white border border-gray-300 rounded-lg px-4 py-3 text-sm text-gray-900 focus:outline-none focus:border-blue-500 transition-all shadow-sm" autoFocus={idx === batchScripts.length - 1} /></div>
+                                  <div key={idx} className="flex gap-3 items-center animate-in slide-in-from-left-2 duration-300"><span className="text-xs font-mono text-gray-400 w-6 text-right">{idx + 1}.</span><input ref={idx === batchScripts.length - 1 ? batchInputRef : null} type="text" value={String(script)} placeholder={idx === batchScripts.length - 1 ? "输入新台词文案..." : ""} onChange={(e) => handleScriptChange(idx, e.target.value)} onCompositionStart={() => composingRef.current = true} onCompositionEnd={(e) => { composingRef.current = false; handleScriptChange(idx, e.target.value); }} className="flex-1 bg-white border border-gray-300 rounded-lg px-4 py-3 text-sm text-gray-900 focus:outline-none focus:border-blue-500 transition-all shadow-sm" autoFocus={idx === batchScripts.length - 1} /></div>
                               ))}
                           </div>
                       ) : (
@@ -649,14 +806,14 @@ export default function App() {
               <div className="bg-white border border-gray-200 rounded-xl shadow-2xl w-full max-w-md p-6 space-y-6">
                   <div className="flex justify-between items-center border-b border-gray-100 pb-4"><h3 className="font-bold text-gray-900 text-lg">系统设置</h3><button onClick={() => setShowSettings(false)} className="text-gray-400 hover:text-gray-900"><IconX size={20}/></button></div>
                   <div className="space-y-4">
-                      <div className="space-y-2"><label className="text-xs font-semibold text-gray-500 uppercase flex items-center gap-2"><IconLink size={12}/> API 地址 (Endpoint)</label><input type="text" value={String(config.baseUrl || '')} onChange={(e) => setConfig({...config, baseUrl: e.target.value})} className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2.5 text-sm text-gray-900 focus:outline-none focus:border-blue-500 transition-all" /></div>
-                      <div className="space-y-2"><label className="text-xs font-semibold text-gray-500 uppercase">API 密钥 (Key)</label><input type="password" value={String(config.apiKey || '')} onChange={(e) => setConfig({...config, apiKey: e.target.value})} className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2.5 text-sm text-gray-900 focus:outline-none focus:border-blue-500 transition-all" /></div>
+                      <div className="space-y-2"><label className="text-xs font-semibold text-gray-500 uppercase flex items-center gap-2"><IconLink size={12}/> API 地址 (Endpoint)</label><input type="text" value={String(config.baseUrl || '')} onChange={(e) => setConfig({...config, baseUrl: e.target.value})} onCompositionStart={() => composingRef.current = true} onCompositionEnd={(e) => { composingRef.current = false; setConfig({...config, baseUrl: e.target.value}); }} className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2.5 text-sm text-gray-900 focus:outline-none focus:border-blue-500 transition-all" /></div>
+                      <div className="space-y-2"><label className="text-xs font-semibold text-gray-500 uppercase">API 密钥 (Key)</label><input type="password" value={String(config.apiKey || '')} onChange={(e) => setConfig({...config, apiKey: e.target.value})} onCompositionStart={() => composingRef.current = true} onCompositionEnd={(e) => { composingRef.current = false; setConfig({...config, apiKey: e.target.value}); }} className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2.5 text-sm text-gray-900 focus:outline-none focus:border-blue-500 transition-all" /></div>
                   </div>
                   <div className="pt-4 border-t border-gray-100 space-y-4">
                       <div className="space-y-2"><label className="text-xs font-semibold text-gray-500 uppercase flex items-center gap-2"><IconLayers size={12}/> 并发控制</label><input type="number" min="1" value={config.maxConcurrent} onChange={(e) => setConfig({...config, maxConcurrent: Math.max(1, parseInt(e.target.value) || 1)})} className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2.5 text-sm text-gray-900 focus:outline-none focus:border-blue-500" /></div>
                       <div className="space-y-2"><label className="text-xs font-semibold text-gray-500 uppercase flex items-center gap-2"><IconClock size={12}/> 提交间隔 (秒)</label><div className="flex items-center gap-3"><input type="number" min="0.1" step="0.1" value={config.taskInterval} onChange={(e) => setConfig({...config, taskInterval: Math.max(0.1, parseFloat(e.target.value) || 0.1)})} className="flex-1 bg-white border border-gray-300 rounded-lg px-3 py-2.5 text-sm text-gray-900 focus:outline-none focus:border-blue-500" /><span className="text-xs text-gray-400 font-medium">S</span></div></div>
                   </div>
-                  <div className="flex justify-end pt-2"><button onClick={() => setShowSettings(false)} className="px-5 py-2 bg-blue-600 text-white text-sm font-bold rounded-lg hover:bg-blue-700 shadow-sm transition-all">保存并关闭</button></div>
+                  <div className="flex justify-end pt-2"><button onClick={handleSaveSettings} className="px-5 py-2 bg-blue-600 text-white text-sm font-bold rounded-lg hover:bg-blue-700 shadow-sm transition-all">保存并关闭</button></div>
               </div>
           </div>
       )}
