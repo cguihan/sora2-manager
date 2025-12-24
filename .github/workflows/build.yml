@@ -31,6 +31,7 @@ jobs:
         run: npm run electron:build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # 某些构建工具需要这个权限
+          CSC_IDENTITY_AUTO_DISCOVERY: false # <--- 关键修改：强制跳过证书自动发现和签名          
 
       # 5. 上传构建产物 (把生成的 .exe 文件存下来)
       - name: Upload Artifacts
