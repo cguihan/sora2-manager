@@ -44,6 +44,6 @@
       "target": "nsis",
       "forceCodeSigning": false  
     }
-    }
+    
   }
 }
