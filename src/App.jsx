@@ -96,6 +96,7 @@ export default function App() {
   // --- 交互状态 (Toast, Tooltip) ---
   const [activeTooltip, setActiveTooltip] = useState(null);
   const [toastVisible, setToastVisible] = useState(false);
+    const [previewVideo, setPreviewVideo] = useState(null);
 
   // --- 调度器状态 ---
   const logsEndRef = useRef(null);
@@ -158,8 +159,13 @@ export default function App() {
             } else if (savedProjects && typeof savedProjects === 'object') {
                 if (Array.isArray(savedProjects.projects) && savedProjects.projects.length > 0) {
                     setProjects(savedProjects.projects);
-                    if (savedProjects.activeId) setActiveProjectId(savedProjects.activeId);
-                    else setActiveProjectId(savedProjects.projects[0].id);
+                    // 恢复之前选中的项目ID，如果不存在则使用第一个项目
+                    const projectIds = savedProjects.projects.map(p => p.id);
+                    if (savedProjects.activeId && projectIds.includes(savedProjects.activeId)) {
+                        setActiveProjectId(savedProjects.activeId);
+                    } else {
+                        setActiveProjectId(savedProjects.projects[0].id);
+                    }
                 }
             } else {
                 // 未找到已保存的数据 -> 使用内置示例并设为已加载状态
@@ -173,10 +179,12 @@ export default function App() {
                 const q = localStorage.getItem('sora2-queue');
                 const parsed = q ? JSON.parse(q) : null;
                 if (Array.isArray(parsed)) {
+                    // 只将运行中的任务标记为 PENDING，保留已完成和失败的任务
                     const normalized = parsed.map(t => {
                         if (['GENERATING','STARTING','PROCESSING','CACHING'].includes(t.status)) {
                             return { ...t, status: 'PENDING', stage: '等待中', progress: 0 };
                         }
+                        // 保留 COMPLETED, FAILED, PENDING 等状态
                         return t;
                     });
                     setQueue(normalized);
@@ -202,7 +210,6 @@ export default function App() {
         const payload = { projects, activeId: activeProjectId };
         try {
             localStorage.setItem('sora2-projects', JSON.stringify(payload));
-            addLog('系统: 项目已保存到 localStorage。', 'success');
         } catch (e) {
             addLog('系统: 保存到 localStorage 失败。', 'error');
         }
@@ -213,7 +220,6 @@ export default function App() {
         if (!queueLoadedRef.current) return;
         try {
             localStorage.setItem('sora2-queue', JSON.stringify(queue));
-            addLog('系统: 队列已保存到 localStorage。', 'success');
         } catch (e) {
             addLog('系统: 保存队列到 localStorage 失败。', 'error');
         }
@@ -463,6 +469,20 @@ export default function App() {
       setQueue(prev => prev.map(t => t.id === id ? { ...t, ...updates } : t));
   };
 
+  const retryTask = (taskId) => {
+      setQueue(prev => prev.map(t => 
+          t.id === taskId 
+              ? { ...t, status: 'PENDING', stage: '等待中', progress: 0, errorMessage: null, streamLog: '' }
+              : t
+      ));
+      addLog(`[任务 ${taskId}] 已重新加入队列。`, 'info');
+  };
+
+  const deleteTask = (taskId) => {
+      setQueue(prev => prev.filter(t => t.id !== taskId));
+      addLog(`[任务 ${taskId}] 已删除。`, 'info');
+  };
+
   const triggerDownload = (url, taskId) => {
     const filename = `sora_task_${taskId}.mp4`;
     if (window.electronAPI && typeof window.electronAPI.downloadVideo === 'function') {
@@ -494,10 +514,26 @@ export default function App() {
           const decoder = new TextDecoder();
           let buffer = ""; 
           let accumulatedContent = "";
+          let taskCompleted = false;
 
           while (true) {
               const { done, value } = await reader.read();
-              if (done) break;
+              if (done) {
+                  // 流结束后检查是否已找到 URL
+                  if (!taskCompleted && accumulatedContent) {
+                      const srcMatch = accumulatedContent.match(/src=['"]([^'"]+?)['"]/);
+                      const urlMatch = accumulatedContent.match(/(https?:\/\/[^\s)"<]+)/);
+                      let foundUrl = srcMatch ? srcMatch[1] : (urlMatch ? urlMatch[1] : null);
+                      
+                      if (foundUrl) {
+                          addLog(`[任务 ${taskId}] 生成完成，URL: ${foundUrl}`, 'success');
+                          updateTask(taskId, { status: 'COMPLETED', stage: '已完成', progress: 100, videoUrl: foundUrl });
+                          triggerDownload(foundUrl, taskId);
+                          taskCompleted = true;
+                      }
+                  }
+                  break;
+              }
               buffer += decoder.decode(value, { stream: true });
               const lines = buffer.split('\n');
               buffer = lines.pop(); 
@@ -565,13 +601,18 @@ export default function App() {
 
                               updateTask(taskId, updates);
 
-                              const srcMatch = combinedChunk.match(/src=['"]([^'"]+?)['"]/);
-                              const urlMatch = combinedChunk.match(/(https?:\/\/[^\s)"]+)/);
-                              let foundUrl = srcMatch ? srcMatch[1] : (urlMatch && !combinedChunk.includes("<") ? urlMatch[0] : null);
+                              // 在流处理过程中尝试提取 URL
+                              if (!taskCompleted) {
+                                  const srcMatch = combinedChunk.match(/src=['"]([^'"]+?)['"]/);
+                                  const urlMatch = combinedChunk.match(/(https?:\/\/[^\s)"<]+)/);
+                                  let foundUrl = srcMatch ? srcMatch[1] : (urlMatch ? urlMatch[1] : null);
 
-                              if (foundUrl) {
-                                  updateTask(taskId, { status: 'COMPLETED', stage: '已完成', progress: 100, videoUrl: foundUrl });
-                                  triggerDownload(foundUrl, taskId);
+                                  if (foundUrl) {
+                                      addLog(`[任务 ${taskId}] 生成完成，URL: ${foundUrl}`, 'success');
+                                      updateTask(taskId, { status: 'COMPLETED', stage: '已完成', progress: 100, videoUrl: foundUrl });
+                                      triggerDownload(foundUrl, taskId);
+                                      taskCompleted = true;
+                                  }
                               }
                           }
                       } catch (e) {
@@ -750,7 +791,7 @@ export default function App() {
                                                 onClick={() => { if (task.status === 'FAILED' && task.errorMessage) handleCopy(task.errorMessage); }}
                                                 style={{ cursor: 'help' }}
                                             >
-                                                <StatusBadge status={task.status} stage={task.stage} progress={task.progress} warning={task.warning} />
+                                                <StatusBadge status={task.status} stage={task.stage} progress={task.progress} warning={task.warning} taskId={task.id} onRetry={retryTask} onDelete={deleteTask} videoUrl={task.videoUrl} onPreview={() => setPreviewVideo(task.videoUrl)} />
                                             </td>
                                         </tr>
                                     ))}
@@ -833,13 +874,53 @@ export default function App() {
       })()}
 
       {toastVisible && <div className="fixed top-20 left-1/2 transform -translate-x-1/2 bg-gray-800 text-white px-4 py-2 rounded-lg shadow-lg text-sm z-[60] animate-in fade-in zoom-in duration-200">已复制内容</div>}
+
+          {previewVideo && (
+              <div
+                  className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-200"
+                  onClick={() => setPreviewVideo(null)}
+              >
+                  <div
+                      className="w-full max-w-4xl bg-black rounded-lg overflow-hidden shadow-2xl animate-in zoom-in duration-200"
+                      onClick={(e) => e.stopPropagation()}
+                  >
+                      <div className="relative w-full aspect-video bg-black flex items-center justify-center">
+                          <video
+                              src={String(previewVideo)}
+                              className="w-full h-full object-contain"
+                              controls
+                              autoPlay
+                          />
+                      </div>
+                      <div className="p-4 bg-gray-900 flex justify-end">
+                          <button
+                              onClick={() => setPreviewVideo(null)}
+                              className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white text-sm font-medium rounded-lg transition-colors"
+                          >
+                              关闭
+                          </button>
+                      </div>
+                  </div>
+              </div>
+          )}
     </div>
   );
 }
 
-const StatusBadge = ({ status, stage, progress, warning }) => {
+const StatusBadge = ({ status, stage, progress, warning, taskId, onRetry, onDelete, videoUrl, onPreview }) => {
+    const [confirmDelete, setConfirmDelete] = useState(false);
     let styles = "bg-gray-100 text-gray-500 border-gray-200";
     let text = status;
+    
+    const handleDeleteClick = () => {
+        if (!confirmDelete) {
+            setConfirmDelete(true);
+            setTimeout(() => setConfirmDelete(false), 2000);
+        } else {
+            onDelete?.(taskId);
+            setConfirmDelete(false);
+        }
+    };
 
     if (status === 'GENERATING' || status === 'STARTING') {
         return (
@@ -864,6 +945,38 @@ const StatusBadge = ({ status, stage, progress, warning }) => {
             styles = "bg-green-50 text-green-600 border-green-200";
             text = "已完成";
         }
+        
+        return (
+            <div className="flex items-center gap-2">
+                <span className={`px-2.5 py-1 rounded text-[10px] font-bold uppercase tracking-wide border ${styles}`}>{String(text)}</span>
+                    {videoUrl && (
+                        <button
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                onPreview?.();
+                            }}
+                            className="px-2.5 py-1 rounded text-[10px] font-bold uppercase tracking-wide border border-green-300 bg-green-50 text-green-600 hover:bg-green-100 transition-colors"
+                            title="预览视频"
+                        >
+                            预览
+                        </button>
+                    )}
+                <button
+                    onClick={(e) => {
+                        e.stopPropagation();
+                        handleDeleteClick();
+                    }}
+                    className={`px-2.5 py-1 rounded text-[10px] font-bold uppercase tracking-wide border transition-colors ${
+                        confirmDelete
+                            ? 'border-orange-400 bg-orange-100 text-orange-700'
+                            : 'border-red-300 bg-red-50 text-red-600 hover:bg-red-100'
+                    }`}
+                    title={confirmDelete ? '再次点击以确认删除' : '点击删除任务'}
+                >
+                    {confirmDelete ? '确认删除' : '删除'}
+                </button>
+            </div>
+        );
     } else if (status === 'FAILED') {
         if (stage === '内容违规') {
             styles = "bg-orange-50 text-orange-600 border-orange-200";
@@ -875,6 +988,36 @@ const StatusBadge = ({ status, stage, progress, warning }) => {
             styles = "bg-red-50 text-red-600 border-red-200";
             text = "失败";
         }
+
+        return (
+            <div className="flex items-center gap-2">
+                <span className={`px-2.5 py-1 rounded text-[10px] font-bold uppercase tracking-wide border ${styles}`}>{String(text)}</span>
+                <button
+                    onClick={(e) => {
+                        e.stopPropagation();
+                        onRetry?.(taskId);
+                    }}
+                    className="px-2.5 py-1 rounded text-[10px] font-bold uppercase tracking-wide border border-blue-300 bg-blue-50 text-blue-600 hover:bg-blue-100 transition-colors"
+                    title="重试任务"
+                >
+                    重试
+                </button>
+                <button
+                    onClick={(e) => {
+                        e.stopPropagation();
+                        handleDeleteClick();
+                    }}
+                    className={`px-2.5 py-1 rounded text-[10px] font-bold uppercase tracking-wide border transition-colors ${
+                        confirmDelete
+                            ? 'border-orange-400 bg-orange-100 text-orange-700'
+                            : 'border-red-300 bg-red-50 text-red-600 hover:bg-red-100'
+                    }`}
+                    title={confirmDelete ? '再次点击以确认删除' : '点击删除任务'}
+                >
+                    {confirmDelete ? '确认删除' : '删除'}
+                </button>
+            </div>
+        );
     } else {
         text = status === 'PENDING' ? '等待中' : status;
     }
